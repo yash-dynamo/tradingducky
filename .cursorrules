@@ -1,0 +1,231 @@
+## Project: Hotstuff TypeScript SDK – AI Trading Integration
+
+This file tells Cursor’s AI how to work with the Hotstuff TS SDK when building AI‑driven trading tooling and agents.
+
+---
+
+## 1. High‑level architecture
+
+- The SDK exposes three main client types (see `src/clients`):
+  - `ExchangeClient` – **write** actions (place/cancel orders, transfers, vaults, account actions).
+  - `InfoClient` – **read** actions (account data, instruments, orderbook, trades, etc).
+  - `SubscriptionClient` – realtime data over WebSocket (not always needed for first AI integrations).
+- Transport is abstracted via:
+  - `HttpTransport` – REST over HTTP. Choose environment with `env: 'testnet' | 'mainnet' | 'local'`.
+  - `WebSocketTransport` – streaming; used by `SubscriptionClient`.
+- Private keys are handled via `viem`:
+  - `privateKeyToAccount` → viem `account`.
+  - `createWalletClient({... account, chain: mainnet, transport: http() })` → EIP‑712 signer used by `ExchangeClient`.
+- **Signing & payload format**:
+  - All write actions are signed as EIP‑712 `Action` messages (see `src/signing/base.ts`).
+  - `ExchangeClient._executeAction` encodes payload via MessagePack, hashes it with `keccak256`, then signs.
+  - The request body to `/exchange` looks like:
+
+    ```jsonc
+    {
+      "action": {
+        "data": { /* action params */ },
+        "type": "1301" // txType from ACTIONS_OP_CODES
+      },
+      "signature": "0x...",
+      "nonce": 123456789
+    }
+    ```
+
+---
+
+## 2. How to initialize clients (for AI tools)
+
+### 2.1 Environment & transport
+
+- Prefer `HttpTransport` for AI apps (server‑side bots, backends, tools):
+
+```ts
+import { HttpTransport } from './src/transports';
+
+const transport = new HttpTransport({
+  env: 'testnet', // or 'mainnet'
+  timeout: 3_000,
+});
+```
+
+### 2.2 Wallet & signer
+
+- Use `viem` to create a wallet client from a private key (never hardcode real keys in committed code):
+
+```ts
+import { createWalletClient, http } from 'viem';
+import { mainnet } from 'viem/chains';
+import { privateKeyToAccount } from 'viem/accounts';
+
+const privateKey = process.env.API_WALLET_PRIVATE_KEY as `0x${string}`;
+const account = privateKeyToAccount(privateKey);
+
+const wallet = createWalletClient({
+  account,
+  chain: testnet, // EIP‑712 domain uses chainId 1image.png
+  transport: http(),
+});
+```
+
+### 2.3 Exchange & Info clients
+
+```ts
+import { ExchangeClient, InfoClient } from './src/clients';
+
+const exchange = new ExchangeClient({
+  transport,
+  wallet,
+});
+
+const info = new InfoClient({
+  transport,
+});
+```
+
+---
+
+## 3. How trading actions work (for AI agents)
+
+### 3.1 Placing orders
+
+- Use `ExchangeClient.placeOrder` (see `src/types/actions/trading.ts` for full shape):
+
+```ts
+await exchange.placeOrder({
+  orders: [
+    {
+      instrumentId: 1,
+      side: 'b',                // 'b' or 's'
+      positionSide: 'LONG',     // 'LONG' | 'SHORT' | 'BOTH'
+      price: '100',
+      size: '1',
+      tif: 'GTC',               // 'GTC' | 'IOC' | 'FOK'
+      ro: false,
+      po: false,
+      cloid: 'ai-bot-<uuid>',
+      triggerPx: '',
+      isMarket: false,
+      tpsl: '',
+      grouping: '',
+    },
+  ],
+  expiresAfter: Date.now() + 60 * 60 * 1000,
+});
+```
+
+- AI patterns:
+  - Let the AI decide **side**, **size**, **limit/market**, **TIF**, but always validate numerically on the backend (e.g., max size, allowed instruments).
+  - Generate unique `cloid` from bot name + timestamp/uuid for easier cancelation and tracking.
+
+### 3.2 Cancelling orders
+
+- Cancel by server order ID:
+
+```ts
+await exchange.cancelByOid({
+  cancels: [{ oid: 123456, instrumentId: 1 }],
+  expiresAfter: Date.now() + 5 * 60 * 1000,
+});
+```
+
+- Cancel by client order ID:
+
+```ts
+await exchange.cancelByCloid({
+  cancels: [{ cloid: 'ai-bot-<uuid>', instrumentId: 1 }],
+  expiresAfter: Date.now() + 5 * 60 * 1000,
+});
+```
+
+- Cancel all / instrument / instrument kind:
+  - `cancelAll({ expiresAfter })`
+  - `cancelByInstrument({ instrumentId, expiresAfter })`
+  - `cancelByInstrumentKind({ kind: 'perp', expiresAfter })`
+
+---
+
+## 4. Agents & API wallets
+
+### 4.1 Concept
+
+- **Owner wallet**: primary account that holds balances; must be recognized by the backend for the target env.
+- **Agent (API) wallet**: separate EOA that may be allowed to act on behalf of the owner, registered via `addAgent`.
+
+### 4.2 Using `addAgent`
+
+- The SDK’s `addAgent` flow (`ExchangeClient.addAgent`) expects:
+  - `wallet` of the **owner** passed into `ExchangeClient`.
+  - `agentPrivateKey` in params to derive the agent account for the inner signature.
+
+- AI integration guideline:
+  - For safety, keep agent registration in a **separate, manual script**, not inside an AI decision loop.
+  - Once an agent is registered, use its private key as the signer in your AI trading service.
+
+---
+
+## 5. Reading data for AI decisions
+
+- Use `InfoClient` methods (see `src/clients/info/base.ts`) to fetch:
+  - Global:
+    - `getInstruments({ type: 'all' | 'perps' | 'spot' | 'options' })`
+    - `getMids({})`, `getTicker({ symbol })`, `getOrderbook({ symbol, depth })`, `getTrades({ symbol, limit })`
+  - Account:
+    - `accountSummary({ user: address })`
+    - `openOrders({ user })`, `positions({ user })`, `orderHistory({ user, limit })`, etc.
+
+- AI patterns:
+  - Pipe `InfoClient` data into features (e.g., mid price, spread, depth).
+  - Let the LLM reason over structured summaries rather than raw orderbooks (for latency & safety).
+
+---
+
+## 6. Error handling & safety for AI
+
+- Common backend errors:
+  - `"account does not exist"` – signer address has no trading account on this env.
+  - `"invalid order signer"` – signer is not permitted to submit that `txType` (e.g., agent vs owner rules).
+  - Broker / margin / leverage errors – business logic failures; handle defensively.
+
+- AI safety guidelines:
+  - Always enforce **hard limits** in code (max position size, max leverage, whitelisted instruments).
+  - Require explicit user confirmation for:
+    - First deployment of a strategy.
+    - Drastic parameter changes (e.g., 10x larger size).
+  - Log every action + parameters + response and periodically summarize for human review.
+
+---
+
+## 7. Coding conventions for this repo
+
+- TypeScript:
+  - Follow `tsconfig.json` settings (strict, ES2020, moduleResolution: `bundler`).
+  - Keep `src/` as the root (`rootDir`), avoid mixing runtime scripts into `dist/`.
+- Imports:
+  - Prefer relative imports within `src/` (e.g., `./clients`, `./transports`).
+  - Use `viem` utilities for accounts and signing.
+- Secrets:
+  - **Do not** commit real private keys or API secrets.
+  - For examples, either:
+    - Use obviously fake keys, or
+    - Read from `process.env.*` and document required env vars.
+
+---
+
+## 8. How Cursor AI should behave
+
+- When user asks for:
+  - **“place order”, “cancel order”, “create AI bot”**:
+    - Use `ExchangeClient` methods, not raw HTTP, unless specifically requested.
+    - Show or update example scripts under `src/` (e.g. `actions.ts`) instead of creating random new entrypoints.
+  - **“read data”, “analyze markets”**:
+    - Use `InfoClient` and return structured summaries for the LLM to reason about.
+  - **“explain signing / payloads”**:
+    - Reference `src/signing/base.ts`, `src/clients/exchange/base.ts`, and `trading-guide.md`.
+
+- Prefer:
+  - Clear separation between:
+    - **infra scripts** (agent registration, funding accounts).
+    - **AI decision loop** (reads info + sends trading actions).
+  - Minimal, well‑documented public API surface over scattering logic across many files.
+
